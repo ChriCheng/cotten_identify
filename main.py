@@ -571,8 +571,8 @@ def save_json(data: Dict[str, Any], out_path: str | Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="稳健棉花颜色识别")
-    parser.add_argument("--dataset_root", type=str, required=True, help="数据集根目录")
-    parser.add_argument("--color_db", type=str, required=True, help="颜色库 json 路径")
+    parser.add_argument("--dataset_root", type=str, required=False,default='cotton_image/', help="数据集根目录")
+    parser.add_argument("--color_db", type=str, default='color_dataset.json', help="颜色库 json 路径")
     parser.add_argument("--output_json", type=str, default="cotton_color_results.json", help="输出结果 JSON")
     parser.add_argument("--seed", type=int, default=42, help="随机划分种子")
     parser.add_argument("--train_n", type=int, default=6, help="每类前景图中划为训练的张数，默认 6")
