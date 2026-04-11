@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -21,14 +20,15 @@ cotton_color_recognition.py
 说明:
 1. 本脚本不依赖深度学习训练，而是使用“白底估计 + 白平衡 + 前景分割 + 鲁棒主色提取 + DeltaE00 匹配”。
 2. 如果颜色库中没有 lab_D65 字段，则自动由 RGB 计算 Lab。
+3. 已添加详细进度打印，便于查看当前处理到哪个类别、哪个 split、哪一张图片。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Iterable, Any
@@ -39,6 +39,10 @@ from scipy import ndimage
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 # =========================
@@ -201,11 +205,15 @@ class ColorEntry:
 
 def load_color_database(color_db_path: str | Path) -> List[ColorEntry]:
     path = Path(color_db_path)
+    log(f"开始加载颜色库: {path}")
+
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
 
+    log(f"颜色库原始条目数: {len(raw)}")
+
     colors: List[ColorEntry] = []
-    for item in raw:
+    for i, item in enumerate(raw, 1):
         if "lab_D65" in item and item["lab_D65"] is not None:
             lab = np.array(item["lab_D65"], dtype=np.float64)
         else:
@@ -214,7 +222,6 @@ def load_color_database(color_db_path: str | Path) -> List[ColorEntry]:
             elif "hex" in item and item["hex"]:
                 rgb = hex_to_rgb(item["hex"])
             else:
-                # 无法解析时跳过
                 continue
             lab = rgb_to_lab(rgb)
 
@@ -223,7 +230,6 @@ def load_color_database(color_db_path: str | Path) -> List[ColorEntry]:
         elif "hex" in item and item["hex"]:
             rgb = hex_to_rgb(item["hex"])
         else:
-            # 仅在当前条目没有 rgb 时，用 Lab 无法反推稳定 RGB，因此跳过
             continue
 
         colors.append(
@@ -236,9 +242,13 @@ def load_color_database(color_db_path: str | Path) -> List[ColorEntry]:
             )
         )
 
+        if i % 500 == 0:
+            log(f"颜色库加载中: {i}/{len(raw)}")
+
     if not colors:
         raise ValueError(f"颜色库为空或无法解析: {color_db_path}")
 
+    log(f"颜色库加载完成，可用条目数: {len(colors)}")
     return colors
 
 
@@ -287,24 +297,37 @@ def discover_classes(dataset_root: str | Path) -> Dict[str, Dict[str, List[Path]
     }
     """
     dataset_root = Path(dataset_root)
+    log(f"开始扫描数据集目录: {dataset_root.resolve()}")
+
     out: Dict[str, Dict[str, List[Path]]] = {}
 
     for dataset_type in ["gray", "colorful"]:
         type_dir = dataset_root / dataset_type
         if not type_dir.exists():
+            log(f"跳过不存在目录: {type_dir}")
             continue
 
         cls_map: Dict[str, List[Path]] = {}
         subdirs = sorted([d for d in type_dir.iterdir() if d.is_dir()], key=lambda p: p.name)
+
+        log(f"发现数据集分组: {dataset_type}，子目录数: {len(subdirs)}")
+
         for subdir in subdirs:
             imgs = list_images(subdir)
             if imgs:
                 cls_map[subdir.name] = imgs
+                log(f"  类别 {dataset_type}/{subdir.name}: {len(imgs)} 张图")
+
         if cls_map:
             out[dataset_type] = cls_map
 
     if not out:
         raise FileNotFoundError(f"未在 {dataset_root} 下找到有效的 gray/colorful 数据目录")
+
+    total_classes = sum(len(v) for v in out.values())
+    total_images = sum(len(imgs) for cls_map in out.values() for imgs in cls_map.values())
+    log(f"数据集扫描完成: 共 {total_classes} 个类别，{total_images} 张图片")
+
     return out
 
 
@@ -340,7 +363,10 @@ def estimate_background_rgb(rgb: np.ndarray) -> np.ndarray:
     brightness = border.mean(axis=1)
     channel_range = border.max(axis=1) - border.min(axis=1)
 
-    candidates = border[(brightness >= np.percentile(brightness, 70)) & (channel_range <= np.percentile(channel_range, 60))]
+    candidates = border[
+        (brightness >= np.percentile(brightness, 70))
+        & (channel_range <= np.percentile(channel_range, 60))
+    ]
     if len(candidates) < 32:
         candidates = border
 
@@ -429,9 +455,11 @@ def robust_dominant_lab(rgb_balanced: np.ndarray, mask: np.ndarray) -> np.ndarra
     a_core = core[:, 1]
     b_core = core[:, 2]
 
+    start_idx = max(0, int(0.1 * len(L_core)))
+    end_idx = max(1, int(0.9 * len(L_core)))
     dominant = np.array(
         [
-            np.mean(np.sort(L_core)[max(0, int(0.1 * len(L_core))): max(1, int(0.9 * len(L_core)))]),
+            np.mean(np.sort(L_core)[start_idx:end_idx]),
             np.median(a_core),
             np.median(b_core),
         ],
@@ -482,12 +510,37 @@ def compute_prototype_lab(labs: List[np.ndarray]) -> np.ndarray:
     )
 
 
-def summarize_split(image_paths: List[Path], color_db: List[ColorEntry]) -> Dict[str, Any]:
-    image_results = [process_single_image(p, color_db) for p in image_paths]
+def summarize_split(
+    image_paths: List[Path],
+    color_db: List[ColorEntry],
+    dataset_type: str = "",
+    cls_name: str = "",
+    split_name: str = "",
+) -> Dict[str, Any]:
+    image_results = []
+    total = len(image_paths)
+
+    log(f"开始处理 {dataset_type}/{cls_name} [{split_name}]，共 {total} 张")
+
+    for i, p in enumerate(image_paths, 1):
+        log(f"  [{dataset_type}/{cls_name}][{split_name}] 第 {i}/{total} 张: {p.name}")
+        r = process_single_image(p, color_db)
+        image_results.append(r)
+        log(
+            f"  [{dataset_type}/{cls_name}][{split_name}] 完成 {i}/{total}: "
+            f"mask_area_ratio={r['mask_area_ratio']}, dominant_lab={r['dominant_lab']}"
+        )
+
     labs = [np.array(r["dominant_lab"], dtype=np.float64) for r in image_results]
     prototype_lab = compute_prototype_lab(labs)
     consistency = pairwise_max_delta_e(labs)
     prototype_top3 = top_k_matches(prototype_lab, color_db, k=3)
+
+    log(
+        f"完成 {dataset_type}/{cls_name} [{split_name}] 汇总: "
+        f"consistency={round(float(consistency), 4)}, "
+        f"prototype_lab={[round(float(x), 4) for x in prototype_lab]}"
+    )
 
     return {
         "images": image_results,
@@ -503,6 +556,7 @@ def process_dataset(
     seed: int = 42,
     train_n: int = 6,
 ) -> Dict[str, Any]:
+    log("========== 开始整体处理 ==========")
     color_db = load_color_database(color_db_path)
     classes = discover_classes(dataset_root)
 
@@ -527,16 +581,44 @@ def process_dataset(
     all_train_cons = []
     all_test_cons = []
 
+    total_class_count = sum(len(cls_map) for cls_map in classes.values())
+    done_class_count = 0
+    log(f"待处理类别总数: {total_class_count}")
+
     for dataset_type, cls_map in classes.items():
         result["datasets"][dataset_type] = {}
+        log(f"开始处理数据分组: {dataset_type}，共 {len(cls_map)} 个类别")
+
         for cls_name, img_paths in cls_map.items():
+            done_class_count += 1
+            log(
+                f"======== 类别开始 [{done_class_count}/{total_class_count}] "
+                f"{dataset_type}/{cls_name}，原始图像数: {len(img_paths)} ========"
+            )
+
             train_imgs, test_imgs = split_image_paths(img_paths, seed=seed, train_n=train_n)
             result["meta"]["test_n"] = len(test_imgs)
 
-            train_summary = summarize_split(train_imgs, color_db)
-            test_summary = summarize_split(test_imgs, color_db)
+            log(
+                f"{dataset_type}/{cls_name} 划分完成: "
+                f"train={len(train_imgs)} 张, test={len(test_imgs)} 张"
+            )
 
-            # 训练集原型和测试集原型之间的差异，可作为泛化稳定性参考
+            train_summary = summarize_split(
+                train_imgs,
+                color_db,
+                dataset_type=dataset_type,
+                cls_name=cls_name,
+                split_name="train",
+            )
+            test_summary = summarize_split(
+                test_imgs,
+                color_db,
+                dataset_type=dataset_type,
+                cls_name=cls_name,
+                split_name="test",
+            )
+
             proto_gap = float(
                 delta_e_ciede2000(
                     np.array(train_summary["prototype_lab"], dtype=np.float64),
@@ -553,12 +635,23 @@ def process_dataset(
             all_train_cons.append(train_summary["consistency_score"])
             all_test_cons.append(test_summary["consistency_score"])
 
+            log(
+                f"======== 类别完成 {dataset_type}/{cls_name}: "
+                f"train_consistency={train_summary['consistency_score']}, "
+                f"test_consistency={test_summary['consistency_score']}, "
+                f"prototype_gap={round(proto_gap, 4)} ========"
+            )
+
     result["overall"] = {
         "mean_train_consistency": round(float(np.mean(all_train_cons)), 4) if all_train_cons else None,
         "mean_test_consistency": round(float(np.mean(all_test_cons)), 4) if all_test_cons else None,
         "max_train_consistency": round(float(np.max(all_train_cons)), 4) if all_train_cons else None,
         "max_test_consistency": round(float(np.max(all_test_cons)), 4) if all_test_cons else None,
     }
+
+    log("========== 全部处理完成 ==========")
+    log(f"总体结果: {json.dumps(result['overall'], ensure_ascii=False)}")
+
     return result
 
 
@@ -571,12 +664,19 @@ def save_json(data: Dict[str, Any], out_path: str | Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="稳健棉花颜色识别")
-    parser.add_argument("--dataset_root", type=str, required=False,default='cotton_image/', help="数据集根目录")
-    parser.add_argument("--color_db", type=str, default='color_dataset.json', help="颜色库 json 路径")
+    parser.add_argument("--dataset_root", type=str, required=False, default="cotton_image/", help="数据集根目录")
+    parser.add_argument("--color_db", type=str, default="color_dataset.json", help="颜色库 json 路径")
     parser.add_argument("--output_json", type=str, default="cotton_color_results.json", help="输出结果 JSON")
     parser.add_argument("--seed", type=int, default=42, help="随机划分种子")
     parser.add_argument("--train_n", type=int, default=6, help="每类前景图中划为训练的张数，默认 6")
     args = parser.parse_args()
+
+    log("程序启动")
+    log(
+        f"参数: dataset_root={args.dataset_root}, "
+        f"color_db={args.color_db}, output_json={args.output_json}, "
+        f"seed={args.seed}, train_n={args.train_n}"
+    )
 
     results = process_dataset(
         dataset_root=args.dataset_root,
@@ -584,9 +684,11 @@ def main() -> None:
         seed=args.seed,
         train_n=args.train_n,
     )
+
+    log(f"开始保存结果到: {args.output_json}")
     save_json(results, args.output_json)
-    print(f"[OK] 结果已保存到: {args.output_json}")
-    print(json.dumps(results["overall"], ensure_ascii=False, indent=2))
+    log(f"[OK] 结果已保存到: {args.output_json}")
+    print(json.dumps(results["overall"], ensure_ascii=False, indent=2), flush=True)
 
 
 if __name__ == "__main__":
