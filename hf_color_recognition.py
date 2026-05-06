@@ -33,10 +33,20 @@ except ImportError:  # pragma: no cover - scipy is optional.
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+LOG_FILE: Optional[Path] = None
 
 
 def log(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {message}"
+    print(line, flush=True)
+    if LOG_FILE is not None:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def sort_key_numeric_name(path: Path) -> Tuple[int, Any]:
+    return (0, int(path.name)) if path.name.isdigit() else (1, path.name)
 
 
 # =========================
@@ -291,7 +301,7 @@ def clean_mask(mask: np.ndarray) -> np.ndarray:
         mask = ndimage.binary_opening(mask, structure=np.ones((3, 3), dtype=bool))
         mask = ndimage.binary_closing(mask, structure=np.ones((7, 7), dtype=bool))
         mask = ndimage.binary_fill_holes(mask)
-        return largest_connected_component(mask)
+        return keep_large_components(mask, min_area_ratio=0.001)
 
     mask = morph_mask(mask, "erode", 3)
     mask = morph_mask(mask, "dilate", 5)
@@ -309,6 +319,21 @@ def largest_connected_component(mask: np.ndarray) -> np.ndarray:
     sizes = ndimage.sum(mask, labeled, index=np.arange(1, num + 1))
     keep = int(np.argmax(sizes) + 1)
     return labeled == keep
+
+
+def keep_large_components(mask: np.ndarray, min_area_ratio: float = 0.001) -> np.ndarray:
+    if ndimage is None:
+        return mask.astype(bool)
+    mask = np.asarray(mask, dtype=bool)
+    labeled, num = ndimage.label(mask)
+    if num == 0:
+        return mask
+    sizes = ndimage.sum(mask, labeled, index=np.arange(1, num + 1))
+    min_area = max(16, int(mask.size * min_area_ratio))
+    keep_labels = np.where(sizes >= min_area)[0] + 1
+    if len(keep_labels) == 0:
+        keep_labels = np.array([int(np.argmax(sizes) + 1)])
+    return np.isin(labeled, keep_labels)
 
 
 def fill_holes(mask: np.ndarray) -> np.ndarray:
@@ -333,6 +358,48 @@ def classical_rough_mask(rgb: np.ndarray) -> np.ndarray:
     mask = dist > threshold
 
     mask |= (float(bg_lab[0]) - lab[..., 0]) > 2.2
+    return clean_mask(mask)
+
+
+def colorful_threshold_mask(rgb: np.ndarray) -> np.ndarray:
+    """
+    Foreground mask for colorful cotton on white paper.
+
+    This intentionally avoids SAM. Colored cotton has much higher saturation and
+    CIELAB chroma than the white paper background, while paper texture/shadows
+    are mostly low-chroma.
+    """
+    balanced = white_balance_with_background(rgb)
+    rgbf = balanced.astype(np.float64) / 255.0
+    channel_max = rgbf.max(axis=2)
+    channel_min = rgbf.min(axis=2)
+    saturation = (channel_max - channel_min) / (channel_max + 1e-8)
+
+    lab = rgb_to_lab(balanced.astype(np.float64))
+    chroma = np.sqrt(lab[..., 1] ** 2 + lab[..., 2] ** 2)
+    lightness = lab[..., 0]
+
+    border_rgb = _border_pixels(balanced).astype(np.float64) / 255.0
+    border_max = border_rgb.max(axis=1)
+    border_min = border_rgb.min(axis=1)
+    border_sat = (border_max - border_min) / (border_max + 1e-8)
+    border_lab = rgb_to_lab(_border_pixels(balanced))
+    border_chroma = np.sqrt(border_lab[:, 1] ** 2 + border_lab[:, 2] ** 2)
+    bg_lab = rgb_to_lab(estimate_background_rgb(balanced))
+
+    sat_thr = max(0.08, float(np.percentile(border_sat, 99) + 0.035))
+    chroma_thr = max(10.0, float(np.percentile(border_chroma, 99) + 5.0))
+    dark_thr = max(12.0, float(np.percentile(bg_lab[0] - border_lab[:, 0], 99) + 8.0))
+
+    mask = (saturation > sat_thr) | (chroma > chroma_thr) | ((float(bg_lab[0]) - lightness) > dark_thr)
+
+    if ndimage is not None:
+        mask = ndimage.binary_opening(mask, structure=np.ones((3, 3), dtype=bool))
+        mask = ndimage.binary_closing(mask, structure=np.ones((9, 9), dtype=bool))
+        mask = ndimage.binary_fill_holes(mask)
+        mask = keep_large_components(mask, min_area_ratio=0.0005)
+        mask = ndimage.binary_dilation(mask, structure=np.ones((5, 5), dtype=bool))
+        return mask.astype(bool)
     return clean_mask(mask)
 
 
@@ -379,23 +446,34 @@ class ClassicalSegmenter(Segmenter):
         return rough_mask
 
 
+class ColorThresholdSegmenter(Segmenter):
+    name = "color_threshold"
+
+    def segment(self, image: Image.Image, rough_mask: np.ndarray) -> np.ndarray:
+        return colorful_threshold_mask(np.asarray(image.convert("RGB"), dtype=np.uint8))
+
+
 class SamSegmenter(Segmenter):
     name = "sam"
 
-    def __init__(self, model_id: str, device: str) -> None:
+    def __init__(self, model_id: str, device: str, prompt_mode: str) -> None:
         if torch is None:
             raise ImportError("SAM backend requires torch. Install torch and transformers in the active conda environment.")
         from transformers import SamModel, SamProcessor
 
         self.model_id = model_id
         self.device = torch.device(device)
+        self.prompt_mode = prompt_mode
         self.processor = SamProcessor.from_pretrained(model_id)
         self.model = SamModel.from_pretrained(model_id).to(self.device)
         self.model.eval()
 
     def segment(self, image: Image.Image, rough_mask: np.ndarray) -> np.ndarray:
         width, height = image.size
-        box = mask_bbox(rough_mask, width=width, height=height)
+        if self.prompt_mode == "full_box":
+            box = [0, 0, width - 1, height - 1]
+        else:
+            box = mask_bbox(rough_mask, width=width, height=height)
         inputs = self.processor(images=image, input_boxes=[[box]], return_tensors="pt")
         inputs = {k: v.to(self.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
@@ -490,6 +568,9 @@ def make_segmenter(args: argparse.Namespace) -> Segmenter:
     if args.segmentation_backend == "classical":
         log("segmentation backend=classical, device=none")
         return ClassicalSegmenter()
+    if args.segmentation_backend == "color_threshold":
+        log("segmentation backend=color_threshold, device=none")
+        return ColorThresholdSegmenter()
 
     device = args.device
     if device == "auto":
@@ -503,7 +584,7 @@ def make_segmenter(args: argparse.Namespace) -> Segmenter:
     log(f"segmentation backend={args.segmentation_backend}, device={device}")
 
     if args.segmentation_backend == "sam":
-        return SamSegmenter(args.sam_model, device=device)
+        return SamSegmenter(args.sam_model, device=device, prompt_mode=args.sam_prompt_mode)
     if args.segmentation_backend == "rmbg":
         return RmbgSegmenter(args.rmbg_model, device=device, image_size=args.rmbg_image_size)
 
@@ -512,7 +593,7 @@ def make_segmenter(args: argparse.Namespace) -> Segmenter:
         try:
             if backend == "rmbg":
                 return RmbgSegmenter(args.rmbg_model, device=device, image_size=args.rmbg_image_size)
-            return SamSegmenter(args.sam_model, device=device)
+            return SamSegmenter(args.sam_model, device=device, prompt_mode=args.sam_prompt_mode)
         except Exception as exc:  # pragma: no cover - only used when a model is unavailable.
             errors.append(f"{backend}: {exc}")
             log(f"failed to load {backend}: {exc}")
@@ -630,7 +711,7 @@ def discover_classes(dataset_root: str | Path) -> Dict[str, Dict[str, List[Path]
         if not group_dir.exists():
             continue
         class_map: Dict[str, List[Path]] = {}
-        for class_dir in sorted((p for p in group_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
+        for class_dir in sorted((p for p in group_dir.iterdir() if p.is_dir()), key=sort_key_numeric_name):
             images = list_images(class_dir)
             if images:
                 class_map[class_dir.name] = images
@@ -661,6 +742,17 @@ def save_mask(mask: np.ndarray, path: Path) -> None:
     Image.fromarray((mask.astype(np.uint8) * 255), mode="L").save(path)
 
 
+def save_mask_overlay(rgb: np.ndarray, mask: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base = Image.fromarray(rgb, mode="RGB").convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    mask_img = Image.fromarray((mask.astype(np.uint8) * 140), mode="L")
+    color = Image.new("RGBA", base.size, (255, 40, 40, 0))
+    color.putalpha(mask_img)
+    blended = Image.alpha_composite(base, color)
+    blended.save(path)
+
+
 def process_single_image(
     image_path: Path,
     color_db: List[ColorEntry],
@@ -680,6 +772,9 @@ def process_single_image(
     if args.mask_debug_dir:
         rel = image_path.relative_to(Path(args.dataset_root))
         save_mask(mask, Path(args.mask_debug_dir) / rel.with_suffix(".png"))
+    if args.overlay_debug_dir:
+        rel = image_path.relative_to(Path(args.dataset_root))
+        save_mask_overlay(rgb, mask, Path(args.overlay_debug_dir) / rel.with_suffix(".png"))
 
     rgb_balanced = white_balance_with_background(rgb)
     dominant_lab, info = dominant_lab_from_mask(
@@ -717,10 +812,21 @@ def summarize_split(
     class_name: str,
     split_name: str,
 ) -> Dict[str, Any]:
+    if args.limit_images_per_split > 0:
+        image_paths = image_paths[: args.limit_images_per_split]
+
     image_results = []
     for idx, path in enumerate(image_paths, 1):
+        start = time.perf_counter()
         log(f"{group}/{class_name}/{split_name}: {idx}/{len(image_paths)} {path.name}")
         image_results.append(process_single_image(path, color_db, segmenter, args))
+        elapsed = time.perf_counter() - start
+        latest = image_results[-1]
+        log(
+            f"{group}/{class_name}/{split_name}: {idx}/{len(image_paths)} {path.name} "
+            f"done in {elapsed:.2f}s, mask_area={latest['mask_area_ratio']}, "
+            f"fallback={latest['mask_fallback_used']}"
+        )
 
     raw_labs = [np.array(r["dominant_lab"], dtype=np.float64) for r in image_results]
     raw_consistency = pairwise_max_delta_e(raw_labs)
@@ -837,17 +943,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_root", default="cotton_image", help="root folder containing gray/ and colorful/")
     parser.add_argument("--color_db", default="color_dataset.json", help="color database JSON")
     parser.add_argument("--output_json", default="out/cotton_color_results_hf.json", help="output JSON path")
-    parser.add_argument("--segmentation_backend", choices=["sam", "rmbg", "auto", "classical"], default="sam")
+    parser.add_argument("--segmentation_backend", choices=["sam", "rmbg", "auto", "classical", "color_threshold"], default="sam")
     parser.add_argument("--sam_model", default="facebook/sam-vit-base")
+    parser.add_argument("--sam_prompt_mode", choices=["rough_box", "full_box"], default="rough_box", help="SAM prompt box source: rough foreground bbox or full image box")
     parser.add_argument("--rmbg_model", default="briaai/RMBG-1.4")
     parser.add_argument("--rmbg_image_size", type=int, default=1024)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
     parser.add_argument("--allow_classical_fallback", action="store_true", help="fallback to classical mask when model mask is invalid")
     parser.add_argument("--mask_debug_dir", default="", help="optional folder to save binary masks")
+    parser.add_argument("--overlay_debug_dir", default="", help="optional folder to save mask overlays on processed images")
+    parser.add_argument("--log_file", default="", help="optional log file written by Python itself")
     parser.add_argument("--max_size", type=int, default=1280, help="resize images so the longest side is at most this many pixels; use 0 to disable")
     parser.add_argument("--max_color_pixels", type=int, default=12000, help="maximum foreground Lab pixels sampled for dominant-color K-means; use 0 to disable")
     parser.add_argument("--only_group", choices=["gray", "colorful"], default="", help="optional group filter for quick runs")
     parser.add_argument("--only_class", default="", help="optional class folder filter for quick runs, e.g. 1 or 10")
+    parser.add_argument("--limit_images_per_split", type=int, default=0, help="optional quick-debug limit for train/test images per class")
     parser.add_argument("--stabilize_outputs", action="store_true", help="replace each image dominant_lab/top3 with the split median prototype while preserving raw_* fields")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_n", type=int, default=6)
@@ -856,7 +966,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global LOG_FILE
     args = parse_args()
+    if args.log_file:
+        LOG_FILE = Path(args.log_file)
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LOG_FILE.write_text("", encoding="utf-8")
     log("started")
     result = process_dataset(args)
     output_path = Path(args.output_json)
