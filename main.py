@@ -3,7 +3,7 @@
 """
 cotton_color_recognition.py
 
-稳健棉花颜色识别脚本
+稳健棉花颜色识别脚本（加入 K-means 主色提取）
 - 适配目录结构:
     root/
       gray/1,2,3,4,5,6
@@ -18,7 +18,7 @@ cotton_color_recognition.py
     3) 原型色的 Top-3 匹配结果
 
 说明:
-1. 本脚本不依赖深度学习训练，而是使用“白底估计 + 白平衡 + 前景分割 + 鲁棒主色提取 + DeltaE00 匹配”。
+1. 本脚本不依赖深度学习训练，而是使用“白底估计 + 白平衡 + 前景分割 + K-means 主色提取 + DeltaE00 匹配”。
 2. 如果颜色库中没有 lab_D65 字段，则自动由 RGB 计算 Lab。
 3. 已添加详细进度打印，便于查看当前处理到哪个类别、哪个 split、哪一张图片。
 """
@@ -433,46 +433,146 @@ def build_cotton_mask(rgb_balanced: np.ndarray) -> np.ndarray:
     return mask.astype(bool)
 
 
-def robust_dominant_lab(rgb_balanced: np.ndarray, mask: np.ndarray) -> np.ndarray:
+# =========================
+# K-means 主色提取
+# =========================
+def _pairwise_sqdist(X: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """
+    X: (N, D), C: (K, D)
+    return: (N, K)
+    """
+    return np.sum((X[:, None, :] - C[None, :, :]) ** 2, axis=2)
+
+
+def kmeans_lab(
+    pixels: np.ndarray,
+    k: int = 3,
+    max_iter: int = 30,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    轻量 K-means
+    输入:
+        pixels: (N, 3) Lab
+    输出:
+        centers: (K, 3)
+        labels: (N,)
+    """
+    pixels = np.asarray(pixels, dtype=np.float64)
+    n = len(pixels)
+    if n == 0:
+        raise ValueError("kmeans_lab 收到空像素集")
+
+    k = max(1, min(k, n))
+    rng = np.random.default_rng(seed)
+
+    # K-means++ 风格初始化（简化版）
+    centers = np.empty((k, pixels.shape[1]), dtype=np.float64)
+    first_idx = rng.integers(0, n)
+    centers[0] = pixels[first_idx]
+
+    for i in range(1, k):
+        d2 = np.min(_pairwise_sqdist(pixels, centers[:i]), axis=1)
+        prob = d2 / (d2.sum() + 1e-12)
+        next_idx = rng.choice(n, p=prob)
+        centers[i] = pixels[next_idx]
+
+    labels = np.zeros(n, dtype=np.int64)
+
+    for _ in range(max_iter):
+        d2 = _pairwise_sqdist(pixels, centers)
+        new_labels = np.argmin(d2, axis=1)
+
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+
+        new_centers = centers.copy()
+        for ci in range(k):
+            members = pixels[labels == ci]
+            if len(members) > 0:
+                new_centers[ci] = members.mean(axis=0)
+            else:
+                # 空簇：随机重置到一个样本
+                new_centers[ci] = pixels[rng.integers(0, n)]
+        centers = new_centers
+
+    return centers, labels
+
+
+def dominant_lab_by_kmeans(
+    rgb_balanced: np.ndarray,
+    mask: np.ndarray,
+    k: int = 3,
+    seed: int = 42,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    用 K-means 从前景 Lab 像素中提取主色。
+    思路：
+    1) 先取 mask 内像素
+    2) 先按 L 去掉特别亮/特别暗的极端值，减少高光/阴影干扰
+    3) 对剩余像素做 K-means
+    4) 选择“像素最多”的簇作为主簇
+    """
     lab = rgb_to_lab(rgb_balanced.astype(np.float64))
     pixels = lab[mask]
 
+    fallback_used = False
     if len(pixels) == 0:
-        # 极端情况下退化为整图中心区域
         h, w = lab.shape[:2]
         y0, y1 = int(h * 0.2), int(h * 0.8)
         x0, x1 = int(w * 0.2), int(w * 0.8)
         pixels = lab[y0:y1, x0:x1].reshape(-1, 3)
+        fallback_used = True
 
-    # 剔除高光与过深阴影，提高不同蓬松度/面积下的一致性
+    # 剔除极端亮度，减弱高光/阴影影响
     L = pixels[:, 0]
-    low_L, high_L = np.percentile(L, [15, 85])
+    low_L, high_L = np.percentile(L, [10, 90])
     keep = (L >= low_L) & (L <= high_L)
-    core = pixels[keep] if np.count_nonzero(keep) >= 20 else pixels
+    core = pixels[keep] if np.count_nonzero(keep) >= 30 else pixels
 
-    # 再用 a,b 的中位数做鲁棒中心，L 用截尾均值
-    L_core = core[:, 0]
-    a_core = core[:, 1]
-    b_core = core[:, 2]
+    # 像素太少时不聚类，直接返回均值
+    if len(core) < 20:
+        dominant = core.mean(axis=0)
+        info = {
+            "kmeans_k": 1,
+            "dominant_cluster_ratio": 1.0,
+            "fallback_used": fallback_used,
+            "trimmed_pixel_count": int(len(core)),
+        }
+        return dominant, info
 
-    start_idx = max(0, int(0.1 * len(L_core)))
-    end_idx = max(1, int(0.9 * len(L_core)))
-    dominant = np.array(
-        [
-            np.mean(np.sort(L_core)[start_idx:end_idx]),
-            np.median(a_core),
-            np.median(b_core),
-        ],
-        dtype=np.float64,
-    )
-    return dominant
+    effective_k = min(k, len(core))
+    centers, labels = kmeans_lab(core, k=effective_k, max_iter=30, seed=seed)
+    counts = np.bincount(labels, minlength=effective_k)
+    dominant_idx = int(np.argmax(counts))
+    dominant = centers[dominant_idx]
+
+    info = {
+        "kmeans_k": int(effective_k),
+        "dominant_cluster_ratio": round(float(counts[dominant_idx] / len(core)), 6),
+        "fallback_used": fallback_used,
+        "trimmed_pixel_count": int(len(core)),
+    }
+    return dominant, info
 
 
-def process_single_image(image_path: str | Path, color_db: List[ColorEntry]) -> Dict[str, Any]:
+def process_single_image(
+    image_path: str | Path,
+    color_db: List[ColorEntry],
+    kmeans_k: int = 3,
+    seed: int = 42,
+) -> Dict[str, Any]:
     rgb = read_image_rgb(image_path)
     rgb_balanced = white_balance_with_background(rgb)
     mask = build_cotton_mask(rgb_balanced)
-    dom_lab = robust_dominant_lab(rgb_balanced, mask)
+
+    dom_lab, kmeans_info = dominant_lab_by_kmeans(
+        rgb_balanced=rgb_balanced,
+        mask=mask,
+        k=kmeans_k,
+        seed=seed,
+    )
     matches = top_k_matches(dom_lab, color_db, k=3)
 
     return {
@@ -480,6 +580,10 @@ def process_single_image(image_path: str | Path, color_db: List[ColorEntry]) -> 
         "dominant_lab": [round(float(x), 4) for x in dom_lab],
         "top3_matches": matches,
         "mask_area_ratio": round(float(mask.mean()), 6),
+        "kmeans_k": kmeans_info["kmeans_k"],
+        "dominant_cluster_ratio": kmeans_info["dominant_cluster_ratio"],
+        "fallback_used": kmeans_info["fallback_used"],
+        "trimmed_pixel_count": kmeans_info["trimmed_pixel_count"],
     }
 
 
@@ -516,6 +620,8 @@ def summarize_split(
     dataset_type: str = "",
     cls_name: str = "",
     split_name: str = "",
+    kmeans_k: int = 3,
+    seed: int = 42,
 ) -> Dict[str, Any]:
     image_results = []
     total = len(image_paths)
@@ -524,11 +630,13 @@ def summarize_split(
 
     for i, p in enumerate(image_paths, 1):
         log(f"  [{dataset_type}/{cls_name}][{split_name}] 第 {i}/{total} 张: {p.name}")
-        r = process_single_image(p, color_db)
+        r = process_single_image(p, color_db, kmeans_k=kmeans_k, seed=seed)
         image_results.append(r)
         log(
             f"  [{dataset_type}/{cls_name}][{split_name}] 完成 {i}/{total}: "
-            f"mask_area_ratio={r['mask_area_ratio']}, dominant_lab={r['dominant_lab']}"
+            f"mask_area_ratio={r['mask_area_ratio']}, "
+            f"cluster_ratio={r['dominant_cluster_ratio']}, "
+            f"dominant_lab={r['dominant_lab']}"
         )
 
     labs = [np.array(r["dominant_lab"], dtype=np.float64) for r in image_results]
@@ -555,6 +663,7 @@ def process_dataset(
     color_db_path: str | Path,
     seed: int = 42,
     train_n: int = 6,
+    kmeans_k: int = 3,
 ) -> Dict[str, Any]:
     log("========== 开始整体处理 ==========")
     color_db = load_color_database(color_db_path)
@@ -571,7 +680,7 @@ def process_dataset(
             "method": {
                 "white_balance": "paper background normalization",
                 "segmentation": "Lab distance to estimated white background + morphology",
-                "dominant_color": "trimmed-L + median(a,b) robust estimator",
+                "dominant_color": f"foreground Lab K-means (k={kmeans_k}) after highlight/shadow trimming",
                 "matching_metric": "CIEDE2000",
             },
         },
@@ -610,6 +719,8 @@ def process_dataset(
                 dataset_type=dataset_type,
                 cls_name=cls_name,
                 split_name="train",
+                kmeans_k=kmeans_k,
+                seed=seed,
             )
             test_summary = summarize_split(
                 test_imgs,
@@ -617,6 +728,8 @@ def process_dataset(
                 dataset_type=dataset_type,
                 cls_name=cls_name,
                 split_name="test",
+                kmeans_k=kmeans_k,
+                seed=seed,
             )
 
             proto_gap = float(
@@ -663,19 +776,20 @@ def save_json(data: Dict[str, Any], out_path: str | Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="稳健棉花颜色识别")
+    parser = argparse.ArgumentParser(description="稳健棉花颜色识别（K-means版）")
     parser.add_argument("--dataset_root", type=str, required=False, default="cotton_image/", help="数据集根目录")
     parser.add_argument("--color_db", type=str, default="color_dataset.json", help="颜色库 json 路径")
-    parser.add_argument("--output_json", type=str, default="cotton_color_results.json", help="输出结果 JSON")
+    parser.add_argument("--output_json", type=str, default="out/cotton_color_results_kmeans.json", help="输出结果 JSON")
     parser.add_argument("--seed", type=int, default=42, help="随机划分种子")
     parser.add_argument("--train_n", type=int, default=6, help="每类前景图中划为训练的张数，默认 6")
+    parser.add_argument("--kmeans_k", type=int, default=3, help="K-means 聚类数，默认 3")
     args = parser.parse_args()
 
     log("程序启动")
     log(
         f"参数: dataset_root={args.dataset_root}, "
         f"color_db={args.color_db}, output_json={args.output_json}, "
-        f"seed={args.seed}, train_n={args.train_n}"
+        f"seed={args.seed}, train_n={args.train_n}, kmeans_k={args.kmeans_k}"
     )
 
     results = process_dataset(
@@ -683,6 +797,7 @@ def main() -> None:
         color_db_path=args.color_db,
         seed=args.seed,
         train_n=args.train_n,
+        kmeans_k=args.kmeans_k,
     )
 
     log(f"开始保存结果到: {args.output_json}")
