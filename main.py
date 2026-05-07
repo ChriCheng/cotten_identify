@@ -361,9 +361,104 @@ def remove_small_components(mask: np.ndarray, min_area_ratio: float = 0.001) -> 
     return np.isin(labeled, keep_labels)
 
 
+def _border_mask(shape: Tuple[int, int], border_ratio: float = 0.06) -> np.ndarray:
+    h, w = shape
+    b = max(8, int(round(min(h, w) * border_ratio)))
+    mask = np.zeros((h, w), dtype=bool)
+    mask[:b, :] = True
+    mask[-b:, :] = True
+    mask[:, :b] = True
+    mask[:, -b:] = True
+    return mask
+
+
+def _local_std(values: np.ndarray, sigma: float) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    mean = ndimage.gaussian_filter(values, sigma=sigma)
+    mean_sq = ndimage.gaussian_filter(values * values, sigma=sigma)
+    return np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+
+
+def _is_gray_scene(lab: np.ndarray) -> bool:
+    chroma = np.sqrt(lab[..., 1] ** 2 + lab[..., 2] ** 2)
+    border = _border_mask(chroma.shape)
+    return float(np.percentile(chroma[border], 95)) < 8.0 and float(np.percentile(chroma, 95)) < 12.0
+
+
+def _keep_gray_cotton_components(mask: np.ndarray, residual: np.ndarray, texture: np.ndarray) -> np.ndarray:
+    labeled, num = ndimage.label(mask)
+    if num == 0:
+        return mask.astype(bool)
+
+    h, w = mask.shape
+    min_area = max(64, int(h * w * 0.0004))
+    sizes = ndimage.sum(mask, labeled, index=np.arange(1, num + 1))
+    mean_residual = ndimage.mean(residual, labeled, index=np.arange(1, num + 1))
+    mean_texture = ndimage.mean(texture, labeled, index=np.arange(1, num + 1))
+
+    candidates = np.where(sizes >= min_area)[0]
+    if len(candidates) == 0:
+        candidates = np.array([int(np.argmax(sizes))])
+
+    scores = sizes[candidates] * np.maximum(mean_residual[candidates], 0.1) * np.maximum(mean_texture[candidates], 0.1)
+    best_label = int(candidates[int(np.argmax(scores))] + 1)
+    kept = labeled == best_label
+
+    # Keep nearby fragments around the main cotton body, but reject distant paper noise.
+    ys, xs = np.where(kept)
+    if len(xs) == 0:
+        return kept
+    x0, x1 = xs.min(), xs.max()
+    y0, y1 = ys.min(), ys.max()
+    margin = int(round(max(h, w) * 0.08))
+    near_box = (
+        (np.arange(w)[None, :] >= max(0, x0 - margin))
+        & (np.arange(w)[None, :] <= min(w - 1, x1 + margin))
+        & (np.arange(h)[:, None] >= max(0, y0 - margin))
+        & (np.arange(h)[:, None] <= min(h - 1, y1 + margin))
+    )
+
+    strong = (residual > np.percentile(residual[kept], 35)) & (texture > np.percentile(texture[kept], 25))
+    return (kept | (mask & near_box & strong)).astype(bool)
+
+
+def build_gray_cotton_mask(lab: np.ndarray) -> np.ndarray:
+    """灰度棉花：用局部背景扣除和纹理抑制纸面渐变噪音。"""
+    L = lab[..., 0].astype(np.float64)
+    h, w = L.shape
+    short = min(h, w)
+
+    background_sigma = max(24.0, short * 0.035)
+    texture_sigma = max(3.0, short * 0.004)
+    local_bg = ndimage.gaussian_filter(L, sigma=background_sigma)
+    residual = local_bg - L
+    texture = _local_std(L, sigma=texture_sigma)
+
+    border = _border_mask((h, w))
+    # Gray cotton often touches the image border, so high border percentiles can
+    # be foreground rather than paper. Use moderate border stats with caps.
+    residual_thr = max(0.6, min(float(np.percentile(residual[border], 90) + 0.25), 2.0))
+    texture_thr = max(1.2, min(float(np.percentile(texture[border], 75) + 0.25), 2.0))
+
+    seed = (residual > residual_thr) & (texture > texture_thr)
+    softer = (residual > max(0.35, residual_thr * 0.7)) & (texture > max(1.0, texture_thr * 0.75))
+    mask = seed | softer
+
+    mask = ndimage.binary_opening(mask, structure=np.ones((3, 3), dtype=bool))
+    mask = ndimage.binary_closing(mask, structure=np.ones((13, 13), dtype=bool))
+    mask = ndimage.binary_fill_holes(mask)
+    mask = remove_small_components(mask, min_area_ratio=0.0004)
+    mask = _keep_gray_cotton_components(mask, residual=residual, texture=texture)
+    mask = ndimage.binary_dilation(mask, structure=np.ones((5, 5), dtype=bool))
+    return mask.astype(bool)
+
+
 def build_cotton_mask(rgb_balanced: np.ndarray) -> np.ndarray:
     """基于白纸背景差异的前景分割。注意：不填充内部孔洞。"""
     lab = rgb_to_lab(rgb_balanced)
+    if _is_gray_scene(lab):
+        return build_gray_cotton_mask(lab)
+
     bg_rgb = estimate_background_rgb(rgb_balanced)
     bg_lab = rgb_to_lab(bg_rgb)
 
@@ -781,7 +876,39 @@ def extract_dominant_lab(
 # ============================================================
 def round_lab(lab: np.ndarray) -> List[float]:
     return [round(float(x), 4) for x in np.asarray(lab, dtype=np.float64)]
+def save_debug_images(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    image_path: Path,
+    dataset_root: Path,
+    mask_debug_dir: Optional[str],
+    overlay_debug_dir: Optional[str],
+) -> None:
+    try:
+        rel = image_path.relative_to(dataset_root)
+    except ValueError:
+        rel = Path(image_path.name)
 
+    stem_path = rel.with_suffix(".png")
+
+    if mask_debug_dir:
+        out_mask = Path(mask_debug_dir) / stem_path
+        out_mask.parent.mkdir(parents=True, exist_ok=True)
+        mask_img = (mask.astype(np.uint8) * 255)
+        Image.fromarray(mask_img, mode="L").save(out_mask)
+
+    if overlay_debug_dir:
+        out_overlay = Path(overlay_debug_dir) / stem_path
+        out_overlay.parent.mkdir(parents=True, exist_ok=True)
+
+        overlay = rgb.astype(np.float32).copy()
+        red = np.array([255, 0, 0], dtype=np.float32)
+        alpha = 0.45
+
+        overlay[mask] = (1 - alpha) * overlay[mask] + alpha * red
+        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+
+        Image.fromarray(overlay, mode="RGB").save(out_overlay)
 
 def process_single_image(
     image_path: Path,
@@ -795,11 +922,20 @@ def process_single_image(
     l_trim_high: float,
     max_vote_pixels: int,
     seed: int,
+    mask_debug_dir: Optional[str] = None,
+    overlay_debug_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     rgb = read_image_rgb(image_path)
     rgb_balanced = white_balance_with_background(rgb)
     mask = build_cotton_mask(rgb_balanced)
-
+    save_debug_images(
+        rgb=rgb,
+        mask=mask,
+        image_path=image_path,
+        dataset_root=dataset_root,
+        mask_debug_dir=mask_debug_dir,
+        overlay_debug_dir=overlay_debug_dir,
+    )
     raw_lab, info = extract_dominant_lab(
         rgb_balanced=rgb_balanced,
         mask=mask,
@@ -891,6 +1027,8 @@ def summarize_split(
             l_trim_high=args.l_trim_high,
             max_vote_pixels=args.max_vote_pixels,
             seed=args.seed + idx,
+            mask_debug_dir=args.mask_debug_dir,
+            overlay_debug_dir=args.overlay_debug_dir,
         )
         images.append(item)
         log(f"    raw_lab={item['raw_dominant_lab']}, mask={item['mask_area_ratio']}")
@@ -1064,6 +1202,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--l_trim_high", type=float, default=95.0, help="去掉 L 通道最高百分位")
     parser.add_argument("--max_vote_pixels", type=int, default=300000, help="最多用于投票/聚类的像素数，<=0 表示不采样")
     parser.add_argument("--kmeans_k", type=int, default=3, help="dominant_method=kmeans 时的聚类数")
+    parser.add_argument("--mask_debug_dir", type=str, default=None, help="保存 mask 调试图的目录")
+    parser.add_argument("--overlay_debug_dir", type=str, default=None, help="保存 overlay 调试图的目录")
     return parser
 
 
